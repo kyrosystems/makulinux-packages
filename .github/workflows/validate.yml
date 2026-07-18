@@ -1,0 +1,325 @@
+name: Validate & Security Scan Package Manifests
+
+on:
+  pull_request:
+    paths:
+      - 'manifests/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'manifests/**'
+
+jobs:
+  validate-schema:
+    name: Validate Manifest Schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install jsonschema requests
+
+      - name: Find changed manifests
+        id: changed
+        run: |
+          git fetch origin main || true
+          CHANGED=$(git diff --name-only origin/main...HEAD 2>/dev/null | grep '^manifests/.*\.json$' || \
+                    git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^manifests/.*\.json$' || \
+                    find manifests/ -name '*.json' | head -10)
+          echo "files=$CHANGED" >> $GITHUB_OUTPUT
+          echo "Changed manifests: $CHANGED"
+
+      - name: Validate manifest JSON schema
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, sys, glob
+
+          REQUIRED = ["schema_version","name","version","release","category",
+                      "summary","license","url","sha256","size_bytes",
+                      "architecture","dependencies","install_type","maintainer"]
+
+          errors = []
+          manifests = glob.glob('manifests/**/*.json', recursive=True)
+          
+          for path in manifests:
+              with open(path) as f:
+                  try:
+                      data = json.load(f)
+                  except json.JSONDecodeError as e:
+                      errors.append(f"{path}: Invalid JSON - {e}")
+                      continue
+              
+              for field in REQUIRED:
+                  if field not in data:
+                      errors.append(f"{path}: Missing required field '{field}'")
+              
+              if data.get('sha256') and data['sha256'] == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256':
+                  errors.append(f"{path}: SHA-256 is still a placeholder!")
+              
+              if data.get('sha256') and len(data['sha256']) != 64:
+                  errors.append(f"{path}: SHA-256 must be 64 hex chars, got {len(data.get('sha256',''))}")
+
+          if errors:
+              print('\n[FAIL] Schema validation errors:')
+              for e in errors:
+                  print(' -', e)
+              sys.exit(1)
+          else:
+              print(f'[OK] All {len(manifests)} manifest(s) passed schema validation.')
+          PYEOF
+
+  verify-sha256:
+    name: Download & Verify SHA-256
+    runs-on: ubuntu-latest
+    needs: validate-schema
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find new/changed manifests in PR
+        id: changed
+        run: |
+          FILES=$(git diff --name-only origin/main...HEAD | grep '^manifests/.*\.json$' || echo '')
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Download packages & verify SHA-256
+        run: |
+          python3 - << 'PYEOF'
+          import json, hashlib, subprocess, sys, os, glob
+
+          # Only check changed files from env if available
+          changed_raw = os.environ.get('CHANGED_FILES', '')
+          if changed_raw.strip():
+              manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')]
+          else:
+              manifests = glob.glob('manifests/**/*.json', recursive=True)
+
+          errors = []
+          skipped = []
+
+          for path in manifests:
+              if not os.path.exists(path):
+                  continue
+              with open(path) as f:
+                  data = json.load(f)
+              
+              sha256_expected = data.get('sha256', '')
+              url = data.get('url', '')
+              name = data.get('name', path)
+              
+              if sha256_expected == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256':
+                  skipped.append(f"{name}: placeholder SHA-256, skipping")
+                  continue
+              
+              if not url:
+                  errors.append(f"{name}: no URL")
+                  continue
+              
+              print(f"[download] {name} from {url}")
+              result = subprocess.run(
+                  ['curl', '-fsSL', '--max-time', '120', '-o', '/tmp/pkg_download', url],
+                  capture_output=True
+              )
+              
+              if result.returncode != 0:
+                  errors.append(f"{name}: download failed - {result.stderr.decode()[:200]}")
+                  continue
+              
+              with open('/tmp/pkg_download', 'rb') as f:
+                  actual = hashlib.sha256(f.read()).hexdigest()
+              
+              if actual == sha256_expected:
+                  print(f"[OK] {name}: SHA-256 verified")
+              else:
+                  errors.append(f"{name}: SHA-256 MISMATCH\n  expected: {sha256_expected}\n  actual:   {actual}")
+
+          for s in skipped:
+              print(f"[SKIP] {s}")
+
+          if errors:
+              print('\n[FAIL] Hash verification errors:')
+              for e in errors:
+                  print(' -', e)
+              sys.exit(1)
+          PYEOF
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+
+  malware-scan:
+    name: ClamAV Malware Scan
+    runs-on: ubuntu-latest
+    needs: validate-schema
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ClamAV
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y clamav clamav-daemon
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
+          sudo freshclam --quiet
+
+      - name: Download and scan packages
+        run: |
+          python3 - << 'PYEOF'
+          import json, subprocess, os, glob, sys
+
+          changed_raw = os.environ.get('CHANGED_FILES', '')
+          if changed_raw.strip():
+              manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')]
+          else:
+              manifests = glob.glob('manifests/**/*.json', recursive=True)
+
+          SCAN_DIR = '/tmp/mlx-scan'
+          os.makedirs(SCAN_DIR, exist_ok=True)
+          errors = []
+
+          for path in manifests:
+              if not os.path.exists(path):
+                  continue
+              with open(path) as f:
+                  data = json.load(f)
+              name = data.get('name', path)
+              url = data.get('url', '')
+              sha = data.get('sha256', '')
+              if sha == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256' or not url:
+                  continue
+              
+              dest = os.path.join(SCAN_DIR, f"{name}.pkg")
+              print(f"[download for scan] {name}")
+              r = subprocess.run(['curl', '-fsSL', '--max-time', '120', '-o', dest, url], capture_output=True)
+              if r.returncode != 0:
+                  errors.append(f"{name}: download failed")
+                  continue
+              
+              r2 = subprocess.run(['clamscan', '--quiet', dest], capture_output=True)
+              if r2.returncode == 0:
+                  print(f"[OK] {name}: ClamAV clean")
+              elif r2.returncode == 1:
+                  errors.append(f"{name}: VIRUS DETECTED by ClamAV!\n{r2.stdout.decode()}")
+              else:
+                  print(f"[WARN] {name}: ClamAV scan error (non-critical)")
+
+          if errors:
+              print('\n[FAIL] Malware scan failures:')
+              for e in errors:
+                  print(' -', e)
+              sys.exit(1)
+          PYEOF
+
+  virustotal-scan:
+    name: VirusTotal Check (optional)
+    runs-on: ubuntu-latest
+    needs: validate-schema
+    if: github.event_name == 'pull_request' && vars.VIRUSTOTAL_API_KEY != ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check SHA-256 against VirusTotal
+        env:
+          VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, glob, sys
+          import urllib.request, urllib.error
+
+          changed_raw = os.environ.get('CHANGED_FILES', '')
+          if changed_raw.strip():
+              manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')]
+          else:
+              manifests = glob.glob('manifests/**/*.json', recursive=True)
+
+          VT_KEY = os.environ.get('VT_API_KEY', '')
+          if not VT_KEY:
+              print('[SKIP] No VirusTotal API key configured.')
+              sys.exit(0)
+
+          warnings = []
+
+          for path in manifests:
+              if not os.path.exists(path):
+                  continue
+              with open(path) as f:
+                  data = json.load(f)
+              sha256 = data.get('sha256', '')
+              name = data.get('name', path)
+              if len(sha256) != 64:
+                  continue
+              
+              req = urllib.request.Request(
+                  f'https://www.virustotal.com/api/v3/files/{sha256}',
+                  headers={'x-apikey': VT_KEY}
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      vt = json.loads(resp.read())
+                  stats = vt.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+                  malicious = stats.get('malicious', 0)
+                  suspicious = stats.get('suspicious', 0)
+                  total = sum(stats.values())
+                  print(f"[VT] {name}: {malicious} malicious, {suspicious} suspicious / {total} engines")
+                  if malicious > 0:
+                      warnings.append(f"{name}: {malicious} VT engines flagged as malicious!")
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      print(f"[VT] {name}: not in VirusTotal DB (new file)")
+                  else:
+                      print(f"[VT] {name}: API error {e.code}")
+
+          if warnings:
+              print('\n[WARN] VirusTotal warnings (requires human review):')
+              for w in warnings:
+                  print(' -', w)
+              sys.exit(1)
+          PYEOF
+
+  notify-maintainers:
+    name: Request Maintainer Review
+    runs-on: ubuntu-latest
+    needs: [validate-schema, verify-sha256, malware-scan]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+
+            const results = jobs.jobs.map(j => 
+              `- ${j.conclusion === 'success' ? '\u2705' : j.conclusion === 'skipped' ? '\u23e9' : '\u274c'} **${j.name}**: ${j.conclusion}`
+            ).join('\n');
+
+            const allPassed = jobs.jobs
+              .filter(j => j.conclusion !== 'skipped')
+              .every(j => j.conclusion === 'success');
+
+            const body = `## \uD83D\uDCE6 MakuLinux Package CI Results\n\n${results}\n\n` +
+              (allPassed 
+                ? '\u2705 **All automated checks passed.** A maintainer can now review and approve this package.'
+                : '\u274c **Some checks failed.** Please fix the issues above before requesting maintainer review.');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

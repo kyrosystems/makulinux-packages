@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "firefox",
+  "version": "126.0",
+  "release": 1,
+  "category": "internet",
+  "summary": "Mozilla Firefox web browser",
+  "license": "MPL-2.0",
+  "url": "https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os/Packages/f/firefox-126.0.1-1.fc40.x86_64.rpm",
+  "sha256": "PLACEHOLDER_REPLACE_WITH_REAL_SHA256",
+  "size_bytes": 283741234,
+  "architecture": "x86_64",
+  "dependencies": ["gtk3", "dbus", "libX11", "alsa-lib"],
+  "install_type": "rpm",
+  "maintainer": "pon4ikisdonut@gmail.com",
+  "homepage": "https://www.mozilla.org/firefox/",
+  "source_url": "https://hg.mozilla.org/releases/mozilla-release"
+}

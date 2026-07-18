@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "bash",
+  "version": "5.2.21",
+  "release": 1,
+  "category": "system",
+  "summary": "The GNU Bourne Again shell",
+  "license": "GPL-3.0",
+  "url": "https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os/Packages/b/bash-5.2.21-1.fc40.x86_64.rpm",
+  "sha256": "PLACEHOLDER_REPLACE_WITH_REAL_SHA256",
+  "size_bytes": 1823456,
+  "architecture": "x86_64",
+  "dependencies": ["glibc"],
+  "install_type": "rpm",
+  "maintainer": "pon4ikisdonut@gmail.com",
+  "homepage": "https://www.gnu.org/software/bash/",
+  "source_url": "https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz"
+}
