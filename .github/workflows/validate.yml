@@ -2,6 +2,7 @@ name: Validate & Security Scan Package Manifests
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - 'manifests/**'
   push:
@@ -10,43 +11,187 @@ on:
     paths:
       - 'manifests/**'
 
+# Required so github-script can write PR comments and labels
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
 jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 0. Label the PR based on manifest category (winget-like)
+  # ─────────────────────────────────────────────────────────────
+  label-pr:
+    name: Label PR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect categories and apply labels
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+
+            // Get changed manifest files
+            let changed = '';
+            try {
+              changed = execSync('git diff --name-only origin/main...HEAD').toString();
+            } catch (e) {
+              try { changed = execSync('git diff --name-only HEAD~1 HEAD').toString(); } catch {}
+            }
+
+            const files = changed.split('\n').filter(f => f.match(/^manifests\/.*\.json$/));
+            const fs = require('fs');
+            const categories = new Set();
+            const installTypes = new Set();
+            let isNew = false;
+            let isUpdate = false;
+
+            for (const f of files) {
+              if (!fs.existsSync(f)) continue;
+              try {
+                const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+                if (data.category) categories.add(data.category.toLowerCase());
+                if (data.install_type) installTypes.add(data.install_type.toLowerCase());
+              } catch {}
+
+              // New vs update: check if file existed on main
+              try {
+                execSync(`git show origin/main:${f}`, { stdio: 'ignore' });
+                isUpdate = true;
+              } catch {
+                isNew = true;
+              }
+            }
+
+            // Build label list (winget-style)
+            const labelsToAdd = [];
+
+            // Package state
+            if (isNew)    labelsToAdd.push('New package');
+            if (isUpdate) labelsToAdd.push('Package update');
+
+            // Category labels
+            const catMap = {
+              system:   'Category: System',
+              internet: 'Category: Internet',
+              desktop:  'Category: Desktop',
+              devel:    'Category: Development',
+              media:    'Category: Multimedia',
+              games:    'Category: Games',
+              utils:    'Category: Utilities',
+            };
+            for (const cat of categories) {
+              if (catMap[cat]) labelsToAdd.push(catMap[cat]);
+            }
+
+            // Install type labels
+            const typeMap = {
+              rpm:      'Type: RPM',
+              tarball:  'Type: Tarball',
+              appimage: 'Type: AppImage',
+              flatpak:  'Type: Flatpak',
+            };
+            for (const t of installTypes) {
+              if (typeMap[t]) labelsToAdd.push(typeMap[t]);
+            }
+
+            // Status: pending review
+            labelsToAdd.push('Needs review');
+
+            // Ensure labels exist and apply
+            const allLabels = [
+              { name: 'New package',           color: '0075ca', description: 'Adds a new package manifest' },
+              { name: 'Package update',         color: '84b6eb', description: 'Updates an existing package' },
+              { name: 'Category: System',       color: 'e4e669', description: '' },
+              { name: 'Category: Internet',     color: '0052cc', description: '' },
+              { name: 'Category: Desktop',      color: 'bfd4f2', description: '' },
+              { name: 'Category: Development',  color: 'f9d0c4', description: '' },
+              { name: 'Category: Multimedia',   color: 'd93f0b', description: '' },
+              { name: 'Category: Games',        color: 'e11d48', description: '' },
+              { name: 'Category: Utilities',    color: 'cfd3d7', description: '' },
+              { name: 'Type: RPM',              color: 'cc317c', description: '' },
+              { name: 'Type: Tarball',          color: 'f1c232', description: '' },
+              { name: 'Type: AppImage',         color: '006b75', description: '' },
+              { name: 'Type: Flatpak',          color: '4a86cf', description: '' },
+              { name: 'Needs review',           color: 'fbca04', description: 'Waiting for maintainer review' },
+              { name: 'CI: Passed',             color: '0e8a16', description: 'All CI checks passed' },
+              { name: 'CI: Failed',             color: 'b60205', description: 'One or more CI checks failed' },
+              { name: 'CI: Running',            color: 'fef2c0', description: 'CI checks are in progress' },
+              { name: 'Approved',               color: '0e8a16', description: 'Approved by a maintainer' },
+              { name: 'Security: Clean',        color: '0e8a16', description: 'Passed ClamAV + VirusTotal' },
+              { name: 'Security: Flagged',      color: 'b60205', description: 'Flagged by security scan' },
+            ];
+
+            for (const l of allLabels) {
+              try {
+                await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: l.name });
+              } catch {
+                try {
+                  await github.rest.issues.createLabel({ owner: context.repo.owner, repo: context.repo.repo, ...l });
+                } catch {}
+              }
+            }
+
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: labelsToAdd,
+              });
+              core.info('Applied labels: ' + labelsToAdd.join(', '));
+            }
+
+            // Mark as "CI: Running"
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['CI: Running'],
+            });
+
+  # ─────────────────────────────────────────────────────────────
+  # 1. Schema validation
+  # ─────────────────────────────────────────────────────────────
   validate-schema:
     name: Validate Manifest Schema
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install jsonschema requests
-
-      - name: Find changed manifests
-        id: changed
-        run: |
-          git fetch origin main || true
-          CHANGED=$(git diff --name-only origin/main...HEAD 2>/dev/null | grep '^manifests/.*\.json$' || \
-                    git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^manifests/.*\.json$' || \
-                    find manifests/ -name '*.json' | head -10)
-          echo "files=$CHANGED" >> $GITHUB_OUTPUT
-          echo "Changed manifests: $CHANGED"
-
       - name: Validate manifest JSON schema
         run: |
           python3 - << 'PYEOF'
-          import json, os, sys, glob
+          import json, sys, glob
 
           REQUIRED = ["schema_version","name","version","release","category",
                       "summary","license","url","sha256","size_bytes",
                       "architecture","dependencies","install_type","maintainer"]
 
+          VALID_CATEGORIES = {"system","internet","desktop","devel","media","games","utils"}
+          VALID_TYPES      = {"rpm","tarball","appimage","flatpak"}
+
           errors = []
           manifests = glob.glob('manifests/**/*.json', recursive=True)
-          
+
           for path in manifests:
               with open(path) as f:
                   try:
@@ -54,26 +199,32 @@ jobs:
                   except json.JSONDecodeError as e:
                       errors.append(f"{path}: Invalid JSON - {e}")
                       continue
-              
               for field in REQUIRED:
                   if field not in data:
                       errors.append(f"{path}: Missing required field '{field}'")
-              
-              if data.get('sha256') and data['sha256'] == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256':
-                  errors.append(f"{path}: SHA-256 is still a placeholder!")
-              
-              if data.get('sha256') and len(data['sha256']) != 64:
-                  errors.append(f"{path}: SHA-256 must be 64 hex chars, got {len(data.get('sha256',''))}")
+              if data.get('sha256') == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256':
+                  errors.append(f"{path}: SHA-256 is still a placeholder")
+              sha = data.get('sha256', '')
+              if sha and len(sha) != 64:
+                  errors.append(f"{path}: SHA-256 must be 64 hex chars, got {len(sha)}")
+              cat = data.get('category', '')
+              if cat and cat not in VALID_CATEGORIES:
+                  errors.append(f"{path}: Unknown category '{cat}', valid: {sorted(VALID_CATEGORIES)}")
+              it = data.get('install_type', '')
+              if it and it not in VALID_TYPES:
+                  errors.append(f"{path}: Unknown install_type '{it}', valid: {sorted(VALID_TYPES)}")
 
           if errors:
               print('\n[FAIL] Schema validation errors:')
               for e in errors:
                   print(' -', e)
               sys.exit(1)
-          else:
-              print(f'[OK] All {len(manifests)} manifest(s) passed schema validation.')
+          print(f'[OK] {len(manifests)} manifest(s) passed schema validation.')
           PYEOF
 
+  # ─────────────────────────────────────────────────────────────
+  # 2. SHA-256 verification
+  # ─────────────────────────────────────────────────────────────
   verify-sha256:
     name: Download & Verify SHA-256
     runs-on: ubuntu-latest
@@ -84,77 +235,59 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find new/changed manifests in PR
+      - name: Get changed manifests
         id: changed
         run: |
-          FILES=$(git diff --name-only origin/main...HEAD | grep '^manifests/.*\.json$' || echo '')
+          FILES=$(git diff --name-only origin/main...HEAD | grep '^manifests/.*\.json$' || true)
           echo "files<<EOF" >> $GITHUB_OUTPUT
           echo "$FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Download packages & verify SHA-256
+      - name: Download & verify SHA-256
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
         run: |
           python3 - << 'PYEOF'
           import json, hashlib, subprocess, sys, os, glob
 
-          # Only check changed files from env if available
           changed_raw = os.environ.get('CHANGED_FILES', '')
-          if changed_raw.strip():
-              manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')]
-          else:
-              manifests = glob.glob('manifests/**/*.json', recursive=True)
+          manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')] \
+                      if changed_raw.strip() else glob.glob('manifests/**/*.json', recursive=True)
 
-          errors = []
-          skipped = []
+          errors, skipped = [], []
 
           for path in manifests:
-              if not os.path.exists(path):
-                  continue
-              with open(path) as f:
-                  data = json.load(f)
-              
-              sha256_expected = data.get('sha256', '')
-              url = data.get('url', '')
-              name = data.get('name', path)
-              
-              if sha256_expected == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256':
-                  skipped.append(f"{name}: placeholder SHA-256, skipping")
-                  continue
-              
+              if not os.path.exists(path): continue
+              data = json.load(open(path))
+              sha_exp = data.get('sha256', '')
+              url     = data.get('url', '')
+              name    = data.get('name', path)
+
+              if sha_exp == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256':
+                  skipped.append(name); continue
               if not url:
-                  errors.append(f"{name}: no URL")
-                  continue
-              
-              print(f"[download] {name} from {url}")
-              result = subprocess.run(
-                  ['curl', '-fsSL', '--max-time', '120', '-o', '/tmp/pkg_download', url],
-                  capture_output=True
-              )
-              
-              if result.returncode != 0:
-                  errors.append(f"{name}: download failed - {result.stderr.decode()[:200]}")
-                  continue
-              
-              with open('/tmp/pkg_download', 'rb') as f:
-                  actual = hashlib.sha256(f.read()).hexdigest()
-              
-              if actual == sha256_expected:
+                  errors.append(f"{name}: no URL"); continue
+
+              print(f"[dl] {name}  {url}")
+              r = subprocess.run(['curl', '-fsSL', '--max-time', '180',
+                                  '-o', '/tmp/pkg_dl', url], capture_output=True)
+              if r.returncode != 0:
+                  errors.append(f"{name}: download failed — {r.stderr.decode()[:200]}"); continue
+
+              actual = hashlib.sha256(open('/tmp/pkg_dl','rb').read()).hexdigest()
+              if actual == sha_exp:
                   print(f"[OK] {name}: SHA-256 verified")
               else:
-                  errors.append(f"{name}: SHA-256 MISMATCH\n  expected: {sha256_expected}\n  actual:   {actual}")
+                  errors.append(f"{name}: MISMATCH\n  expected: {sha_exp}\n  actual:   {actual}")
 
-          for s in skipped:
-              print(f"[SKIP] {s}")
-
+          for s in skipped: print(f"[SKIP] {s}")
           if errors:
-              print('\n[FAIL] Hash verification errors:')
-              for e in errors:
-                  print(' -', e)
-              sys.exit(1)
+              print('\n[FAIL]'); [print(' -', e) for e in errors]; sys.exit(1)
           PYEOF
-        env:
-          CHANGED_FILES: ${{ steps.changed.outputs.files }}
 
+  # ─────────────────────────────────────────────────────────────
+  # 3. ClamAV
+  # ─────────────────────────────────────────────────────────────
   malware-scan:
     name: ClamAV Malware Scan
     runs-on: ubuntu-latest
@@ -165,102 +298,112 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install ClamAV
+      - name: Get changed manifests
+        id: changed
+        run: |
+          FILES=$(git diff --name-only origin/main...HEAD | grep '^manifests/.*\.json$' || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Install ClamAV & update DB
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y clamav clamav-daemon
+          sudo apt-get install -y clamav
           sudo systemctl stop clamav-freshclam 2>/dev/null || true
           sudo freshclam --quiet
 
-      - name: Download and scan packages
+      - name: Download & scan
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
         run: |
           python3 - << 'PYEOF'
           import json, subprocess, os, glob, sys
 
           changed_raw = os.environ.get('CHANGED_FILES', '')
-          if changed_raw.strip():
-              manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')]
-          else:
-              manifests = glob.glob('manifests/**/*.json', recursive=True)
+          manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')] \
+                      if changed_raw.strip() else glob.glob('manifests/**/*.json', recursive=True)
 
           SCAN_DIR = '/tmp/mlx-scan'
           os.makedirs(SCAN_DIR, exist_ok=True)
           errors = []
 
           for path in manifests:
-              if not os.path.exists(path):
-                  continue
-              with open(path) as f:
-                  data = json.load(f)
+              if not os.path.exists(path): continue
+              data = json.load(open(path))
               name = data.get('name', path)
-              url = data.get('url', '')
-              sha = data.get('sha256', '')
-              if sha == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256' or not url:
-                  continue
-              
+              url  = data.get('url', '')
+              sha  = data.get('sha256', '')
+              if sha == 'PLACEHOLDER_REPLACE_WITH_REAL_SHA256' or not url: continue
+
               dest = os.path.join(SCAN_DIR, f"{name}.pkg")
-              print(f"[download for scan] {name}")
-              r = subprocess.run(['curl', '-fsSL', '--max-time', '120', '-o', dest, url], capture_output=True)
+              print(f"[dl] {name}")
+              r = subprocess.run(['curl', '-fsSL', '--max-time', '180', '-o', dest, url],
+                                 capture_output=True)
               if r.returncode != 0:
-                  errors.append(f"{name}: download failed")
-                  continue
-              
+                  errors.append(f"{name}: download failed"); continue
+
               r2 = subprocess.run(['clamscan', '--quiet', dest], capture_output=True)
-              if r2.returncode == 0:
-                  print(f"[OK] {name}: ClamAV clean")
-              elif r2.returncode == 1:
-                  errors.append(f"{name}: VIRUS DETECTED by ClamAV!\n{r2.stdout.decode()}")
-              else:
-                  print(f"[WARN] {name}: ClamAV scan error (non-critical)")
+              if r2.returncode == 0:   print(f"[OK] {name}: clean")
+              elif r2.returncode == 1: errors.append(f"{name}: VIRUS DETECTED!\n{r2.stdout.decode()}")
+              else:                    print(f"[WARN] {name}: scan error (non-critical)")
 
           if errors:
-              print('\n[FAIL] Malware scan failures:')
-              for e in errors:
-                  print(' -', e)
-              sys.exit(1)
+              print('\n[FAIL]'); [print(' -', e) for e in errors]; sys.exit(1)
           PYEOF
 
+  # ─────────────────────────────────────────────────────────────
+  # 4. VirusTotal — REQUIRED (fails if no API key)
+  # ─────────────────────────────────────────────────────────────
   virustotal-scan:
-    name: VirusTotal Check (optional)
+    name: VirusTotal Scan
     runs-on: ubuntu-latest
     needs: validate-schema
-    if: github.event_name == 'pull_request' && vars.VIRUSTOTAL_API_KEY != ''
+    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check SHA-256 against VirusTotal
+      - name: Get changed manifests
+        id: changed
+        run: |
+          FILES=$(git diff --name-only origin/main...HEAD | grep '^manifests/.*\.json$' || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Check SHA-256 hashes against VirusTotal
         env:
           VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
         run: |
           python3 - << 'PYEOF'
-          import json, os, glob, sys
+          import json, os, glob, sys, time
           import urllib.request, urllib.error
 
-          changed_raw = os.environ.get('CHANGED_FILES', '')
-          if changed_raw.strip():
-              manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')]
-          else:
-              manifests = glob.glob('manifests/**/*.json', recursive=True)
-
-          VT_KEY = os.environ.get('VT_API_KEY', '')
+          VT_KEY = os.environ.get('VT_API_KEY', '').strip()
           if not VT_KEY:
-              print('[SKIP] No VirusTotal API key configured.')
-              sys.exit(0)
+              print('[FAIL] VIRUSTOTAL_API_KEY secret is not set!')
+              print('       Add it in: Settings -> Secrets -> Actions -> New repository secret')
+              print('       Name: VIRUSTOTAL_API_KEY')
+              print('       Get a free API key at: https://www.virustotal.com/gui/join-us')
+              sys.exit(1)
 
-          warnings = []
+          changed_raw = os.environ.get('CHANGED_FILES', '')
+          manifests = [f for f in changed_raw.strip().split('\n') if f.endswith('.json')] \
+                      if changed_raw.strip() else glob.glob('manifests/**/*.json', recursive=True)
+
+          errors, warnings = [], []
 
           for path in manifests:
-              if not os.path.exists(path):
-                  continue
-              with open(path) as f:
-                  data = json.load(f)
+              if not os.path.exists(path): continue
+              data = json.load(open(path))
               sha256 = data.get('sha256', '')
-              name = data.get('name', path)
-              if len(sha256) != 64:
-                  continue
-              
+              name   = data.get('name', path)
+              url    = data.get('url', '')
+              if len(sha256) != 64: continue
+
               req = urllib.request.Request(
                   f'https://www.virustotal.com/api/v3/files/{sha256}',
                   headers={'x-apikey': VT_KEY}
@@ -268,58 +411,147 @@ jobs:
               try:
                   with urllib.request.urlopen(req) as resp:
                       vt = json.loads(resp.read())
-                  stats = vt.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
-                  malicious = stats.get('malicious', 0)
+                  stats = vt.get('data',{}).get('attributes',{}).get('last_analysis_stats',{})
+                  malicious  = stats.get('malicious', 0)
                   suspicious = stats.get('suspicious', 0)
-                  total = sum(stats.values())
+                  total      = sum(stats.values())
                   print(f"[VT] {name}: {malicious} malicious, {suspicious} suspicious / {total} engines")
                   if malicious > 0:
-                      warnings.append(f"{name}: {malicious} VT engines flagged as malicious!")
+                      errors.append(f"{name}: {malicious}/{total} VT engines flagged as MALICIOUS")
+                  elif suspicious > 3:
+                      warnings.append(f"{name}: {suspicious} engines flagged as suspicious")
               except urllib.error.HTTPError as e:
                   if e.code == 404:
-                      print(f"[VT] {name}: not in VirusTotal DB (new file)")
+                      # File not in VT DB — upload it for analysis
+                      print(f"[VT] {name}: not in DB, uploading for analysis...")
+                      if url:
+                          try:
+                              upload_req = urllib.request.Request(
+                                  'https://www.virustotal.com/api/v3/urls',
+                                  data=f'url={urllib.parse.quote(url)}'.encode(),
+                                  headers={'x-apikey': VT_KEY,
+                                           'Content-Type': 'application/x-www-form-urlencoded'},
+                                  method='POST'
+                              )
+                              import urllib.parse
+                              upload_req = urllib.request.Request(
+                                  'https://www.virustotal.com/api/v3/urls',
+                                  data=f'url={urllib.parse.quote(url)}'.encode(),
+                                  headers={'x-apikey': VT_KEY,
+                                           'Content-Type': 'application/x-www-form-urlencoded'},
+                                  method='POST'
+                              )
+                              with urllib.request.urlopen(upload_req) as r:
+                                  print(f"[VT] {name}: submitted for analysis")
+                          except Exception as ex:
+                              print(f"[VT] {name}: could not submit — {ex}")
+                  elif e.code == 429:
+                      print(f"[VT] {name}: rate limited, waiting 60s...")
+                      time.sleep(60)
                   else:
-                      print(f"[VT] {name}: API error {e.code}")
+                      warnings.append(f"{name}: VT API error {e.code}")
+              except Exception as ex:
+                  warnings.append(f"{name}: VT check failed — {ex}")
 
-          if warnings:
-              print('\n[WARN] VirusTotal warnings (requires human review):')
-              for w in warnings:
-                  print(' -', w)
+          for w in warnings: print(f"[WARN] {w}")
+          if errors:
+              print('\n[FAIL] VirusTotal flagged packages:')
+              for e in errors: print(' -', e)
               sys.exit(1)
+          print('[OK] VirusTotal scan complete.')
           PYEOF
 
-  notify-maintainers:
-    name: Request Maintainer Review
+  # ─────────────────────────────────────────────────────────────
+  # 5. Final: update labels + comment on PR
+  # ─────────────────────────────────────────────────────────────
+  finalize:
+    name: Update PR Status
     runs-on: ubuntu-latest
-    needs: [validate-schema, verify-sha256, malware-scan]
+    needs: [validate-schema, verify-sha256, malware-scan, virustotal-scan]
     if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+      issues: write
     steps:
-      - name: Comment on PR
+      - name: Update labels and post comment
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+            const needs = {
+              'Validate Manifest Schema': '${{ needs.validate-schema.result }}',
+              'Download & Verify SHA-256': '${{ needs.verify-sha256.result }}',
+              'ClamAV Malware Scan': '${{ needs.malware-scan.result }}',
+              'VirusTotal Scan': '${{ needs.virustotal-scan.result }}',
+            };
+
+            const icon = r => r === 'success' ? '\u2705' : r === 'skipped' ? '\u23e9' : r === 'cancelled' ? '\u26d4' : '\u274c';
+            const rows = Object.entries(needs).map(([k, v]) => `| ${icon(v)} | **${k}** | \`${v}\` |`).join('\n');
+
+            const allPassed = Object.values(needs)
+              .filter(v => v !== 'skipped')
+              .every(v => v === 'success');
+
+            const status = allPassed
+              ? '\u2705 **All checks passed.** A maintainer can now review and merge this package.'
+              : '\u274c **Some checks failed.** Please fix the issues above.';
+
+            const body = [
+              '## \uD83D\uDCE6 MakuLinux Package CI Report',
+              '',
+              '| Status | Check | Result |',
+              '|--------|-------|--------|',
+              rows,
+              '',
+              status,
+            ].join('\n');
+
+            // Post comment
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              run_id: context.runId
+              issue_number: context.payload.pull_request.number,
+              body,
             });
 
-            const results = jobs.jobs.map(j => 
-              `- ${j.conclusion === 'success' ? '\u2705' : j.conclusion === 'skipped' ? '\u23e9' : '\u274c'} **${j.name}**: ${j.conclusion}`
-            ).join('\n');
+            // Remove 'CI: Running', add CI result label
+            const removeLabel = async (name) => {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  name,
+                });
+              } catch {}
+            };
 
-            const allPassed = jobs.jobs
-              .filter(j => j.conclusion !== 'skipped')
-              .every(j => j.conclusion === 'success');
+            await removeLabel('CI: Running');
 
-            const body = `## \uD83D\uDCE6 MakuLinux Package CI Results\n\n${results}\n\n` +
-              (allPassed 
-                ? '\u2705 **All automated checks passed.** A maintainer can now review and approve this package.'
-                : '\u274c **Some checks failed.** Please fix the issues above before requesting maintainer review.');
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body
-            });
+            if (allPassed) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['CI: Passed', 'Security: Clean'],
+              });
+              await removeLabel('CI: Failed');
+              await removeLabel('Security: Flagged');
+            } else {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['CI: Failed'],
+              });
+              // Check if VT failed specifically
+              if ('${{ needs.virustotal-scan.result }}' === 'failure') {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  labels: ['Security: Flagged'],
+                });
+              }
+              await removeLabel('CI: Passed');
+            }
