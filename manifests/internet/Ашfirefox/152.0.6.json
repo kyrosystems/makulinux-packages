@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "АшFirefox",
+  "version": "152.0.6",
+  "release": 1,
+  "category": "internet",
+  "summary": "Mozilla Firefox, or simply Firefox, is a free and open-source web browser developed by the Mozilla Foundation and its subsidiary, the Mozilla Corporation",
+  "description": "Mozilla Firefox is a standalone web browser, designed for standards compliance, performance, and portability. It includes smart browsing features, privacy protections, and support for thousands of extensions.",
+  "license": "MPL-2.0",
+  "url": "https://kojipkgs.fedoraproject.org//packages/firefox/152.0.6/1.fc44app2/x86_64/firefox-152.0.6-1.fc44app2.x86_64.rpm",
+  "sha256": "0aa7922a87c78ffa703aaa50c1f7135a6095d60642b9d428056af89b0ce38823",
+  "size_bytes": 97078900,
+  "architecture": "x86_64",
+  "dependencies": ["alsa-lib", "atk", "cairo", "dbus-libs", "fontconfig", "freetype", "glib2", "gtk3", "libX11", "libXcomposite", "libXdamage", "libXext", "libXfixes", "libXi", "libXrandr", "libXtst", "libffi", "libgcc", "libstdc++", "libxcb", "nspr", "nss", "pango", "zlib"],
+  "install_type": "rpm",
+  "maintainer": "firefox-owner@fedoraproject.org",
+  "homepage": "https://www.mozilla.org/firefox/",
+  "source_url": "https://archive.mozilla.org/pub/firefox/releases/152.0.6/source/"
+}
