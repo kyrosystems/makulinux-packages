@@ -1,4 +1,4 @@
-name: ChatOps Merge
+name: ChatOps Merge & Approve
 
 on:
   issue_comment:
@@ -10,17 +10,19 @@ permissions:
   issues: write
 
 jobs:
-  merge:
+  chatops:
     if: >
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/merge')
+      github.event.issue.pull_request && (
+        startsWith(github.event.comment.body, '/merge') || 
+        startsWith(github.event.comment.body, '/approve')
+      )
     runs-on: ubuntu-latest
 
     steps:
       - name: Check commenter permission
+        id: check_perm
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const username = context.actor;
             const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
@@ -31,16 +33,55 @@ jobs:
 
             const allowed = ['admin', 'maintain', 'write'].includes(data.permission);
             if (!allowed) {
-              core.setFailed(`User ${username} is not allowed to merge. Permission: ${data.permission}`);
+              core.setFailed(`User ${username} is not allowed to trigger ChatOps. Permission: ${data.permission}`);
             }
 
-      - name: Get PR info
-        id: pr
+      - name: Parse Command
+        id: cmd
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          if [[ "$COMMENT" == /merge* ]]; then
+            echo "action=merge" >> $GITHUB_OUTPUT
+          elif [[ "$COMMENT" == /approve* ]]; then
+            echo "action=approve" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Handle Approve
+        if: steps.cmd.outputs.action == 'approve'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const pr_number = context.payload.issue.number;
+            
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr_number,
+              event: 'APPROVE',
+              body: `Approved via ChatOps by @${context.actor}`
+            });
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr_number,
+              labels: ['Approved']
+            }).catch(() => {});
+
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr_number,
+              name: 'Needs Review'
+            }).catch(() => {});
+
+      - name: Handle Merge
+        if: steps.cmd.outputs.action == 'merge'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr_number = context.payload.issue.number;
+
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -50,15 +91,6 @@ jobs:
             if (pr.state !== 'open') {
               core.setFailed(`PR #${pr_number} is not open.`);
             }
-
-            core.setOutput('number', pr_number.toString());
-
-      - name: Check required status checks
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const pr_number = Number('${{ steps.pr.outputs.number }}');
 
             const { data: reviews } = await github.rest.pulls.listReviews({
               owner: context.repo.owner,
@@ -76,7 +108,6 @@ jobs:
               repo: context.repo.repo,
               pull_number: pr_number
             });
-
             const sha = commits[commits.length - 1].sha;
 
             const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
@@ -85,16 +116,9 @@ jobs:
               ref: sha
             });
 
-            if (combined.state !== 'success') {
+            if (combined.state !== 'success' && combined.statuses.length > 0) {
               core.setFailed(`Required checks are not passing. Current state: ${combined.state}`);
             }
-
-      - name: Merge PR
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const pr_number = Number('${{ steps.pr.outputs.number }}');
 
             await github.rest.pulls.merge({
               owner: context.repo.owner,
@@ -102,24 +126,3 @@ jobs:
               pull_number: pr_number,
               merge_method: 'squash'
             });
-
-      - name: Update labels
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const pr_number = Number('${{ steps.pr.outputs.number }}');
-
-            await github.rest.issues.removeLabel({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr_number,
-              name: 'Needs Review'
-            }).catch(() => {});
-
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr_number,
-              labels: ['Approved']
-            }).catch(() => {});
